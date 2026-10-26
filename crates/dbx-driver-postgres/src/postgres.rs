@@ -2065,7 +2065,7 @@ async fn start_postgres_select_stream(
             unsupported_type: "binary result format".to_string(),
         });
     }
-    if force_unnamed || postgres_client_uses_unnamed_statements(client) {
+    if force_unnamed || postgres_client_uses_unnamed_statements(client) || postgres_statement_fetches_cursor(sql) {
         let metadata = prepare_unnamed_select_metadata(client, sql).await?;
         if let Some(unsupported_type) = metadata.unsupported_type {
             return Ok(PostgresSelectStreamOutcome::TextFallback {
@@ -8895,11 +8895,23 @@ fn postgres_query_body_dml(body: &SetExpr) -> Option<&Statement> {
     }
 }
 
+/// `FETCH` reads from a session cursor whose row shape is only known while that
+/// cursor is open, so its statement must never be served from the named
+/// prepared-statement cache (`MOVE` returns no rows and is not included).
+fn postgres_statement_fetches_cursor(sql: &str) -> bool {
+    starts_with_executable_sql_keyword(sql, &["FETCH"])
+}
+
 /// Returns whether PostgreSQL should execute this statement through the row
 /// retrieval path. DML without `RETURNING` needs `execute` for its command
 /// tag/affected-row count, while DML with `RETURNING` produces a result set.
 pub fn postgres_statement_returns_rows(sql: &str) -> bool {
     if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE"]) {
+        return true;
+    }
+    // `FETCH ... FROM cursor` (e.g. refcursors opened by a procedure) returns
+    // the cursor's rows; `execute` would keep only the `FETCH n` command tag.
+    if postgres_statement_fetches_cursor(sql) {
         return true;
     }
 
@@ -11739,6 +11751,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn postgres_fetch_from_procedure_refcursors_returns_rows() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(10), "UTC").await.unwrap();
+        let client = pool.get().await.unwrap();
+        let run = |sql: &'static str| execute_query_with_max_rows_inner(&client, sql, None, false, None, false);
+
+        run("BEGIN").await.unwrap();
+        run("CREATE PROCEDURE pg_temp.dbx_open_cursors(INOUT a refcursor, INOUT b refcursor) LANGUAGE plpgsql AS $$ \
+             BEGIN OPEN a FOR SELECT g AS id, 'row ' || g AS label FROM generate_series(1, 3) g; \
+             OPEN b FOR SELECT NULL::text AS error_code; END $$")
+        .await
+        .unwrap();
+        run("CALL pg_temp.dbx_open_cursors('c1', 'c2')").await.unwrap();
+        // Run twice per cursor name across transactions so a cached statement
+        // with an outdated row shape would surface here.
+        let first = run(r#"FETCH ALL FROM "c1""#).await.unwrap();
+        assert_eq!(first.columns, vec!["id", "label"]);
+        assert_eq!(first.rows.len(), 3);
+        let second = run("FETCH ALL FROM c2").await.unwrap();
+        assert_eq!(second.columns, vec!["error_code"]);
+        assert_eq!(second.rows.len(), 1);
+        let drained = run(r#"FETCH ALL FROM "c1""#).await.unwrap();
+        assert_eq!(drained.columns, vec!["id", "label"]);
+        assert!(drained.rows.is_empty());
+        run("ROLLBACK").await.unwrap();
+
+        run("BEGIN").await.unwrap();
+        run("DECLARE c1 CURSOR FOR SELECT 42 AS answer").await.unwrap();
+        let reshaped = run("FETCH ALL FROM c1").await.unwrap();
+        assert_eq!(reshaped.columns, vec!["answer"]);
+        assert_eq!(reshaped.rows.len(), 1);
+        run("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL-compatible database"]
     async fn postgres_connection_identity_supports_compatible_servers() {
         let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
@@ -12579,6 +12627,24 @@ mod tests {
         ] {
             assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
         }
+    }
+
+    #[test]
+    fn postgres_statement_returns_rows_for_cursor_fetch() {
+        for sql in [
+            r#"FETCH ALL FROM "c1""#,
+            "fetch next from c2",
+            "FETCH FORWARD 10 IN my_cursor",
+            "-- data\nFETCH ALL FROM c3",
+        ] {
+            assert!(postgres_statement_returns_rows(sql), "expected result rows for: {sql}");
+            assert!(postgres_statement_fetches_cursor(sql), "expected cursor fetch for: {sql}");
+        }
+
+        for sql in ["MOVE FORWARD 5 IN my_cursor", "CLOSE c1", "SELECT 1"] {
+            assert!(!postgres_statement_fetches_cursor(sql), "unexpected cursor fetch for: {sql}");
+        }
+        assert!(!postgres_statement_returns_rows("MOVE ALL IN c1"));
     }
 
     #[test]
