@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and release (e.g. v0.6.55-fork.1)"
+        description: "Release tag to create at the dispatched commit (e.g. v0.6.55-fork.1)"
         required: true
 
 permissions:
@@ -26,8 +26,6 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -58,6 +56,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
+          # A dispatched run creates the tag at the commit it built.
+          releaseCommitish: ${{ github.sha }}
           releaseName: DBX ${{ env.RELEASE_TAG }}
           releaseBody: |
             Unsigned Windows x64 build from this fork. Windows SmartScreen may warn on first launch.
