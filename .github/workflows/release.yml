@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+      # Fork tags are built by fork-release.yml without upstream signing secrets.
+      - "!v*-fork*"
 
 permissions:
   contents: write

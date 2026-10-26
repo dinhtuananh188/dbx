@@ -1,0 +1,67 @@
+name: Fork Release
+
+# Unsigned Windows build for fork releases. The upstream Release workflow needs
+# signing secrets (Tauri updater, VSign) that a fork does not have, so fork tags
+# (`v*-fork*`) are built here instead and excluded from release.yml.
+on:
+  push:
+    tags:
+      - "v*-fork*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.6.55-fork.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 (unsigned)
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: fork-release-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
+      - name: Build Tauri app and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: DBX ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            Unsigned Windows x64 build from this fork. Windows SmartScreen may warn on first launch.
+            See the commits since the previous release for the changes included.
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc --config src-tauri/tauri.fork.conf.json
